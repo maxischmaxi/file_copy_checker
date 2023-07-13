@@ -116,11 +116,12 @@ fn collect_files(base_path: &Path, files: &mut Vec<ReadFile>, pb: &ProgressBar) 
             continue;
         }
 
+        let size = filesize::file_real_size(path.clone()).unwrap();
         files.push(ReadFile { 
             hash,
             first_path: path.to_path_buf(),
             paths: vec![],
-            size: 0
+            size
         });
         pb.set_message(format!("Found new file {}", path.display()));
     }
@@ -235,7 +236,7 @@ fn done(spinner_style: &ProgressStyle) {
     let pb = ProgressBar::new_spinner();
     pb.set_style(spinner_style.clone());
     pb.enable_steady_tick(Duration::from_millis(100));
-    pb.set_prefix("[5/5]");
+    pb.set_prefix("[4/4]");
     pb.set_message("Done!");
     pb.finish();
     std::process::exit(0);
@@ -256,6 +257,63 @@ fn generate_options(files: &Vec<ReadFile>) -> Vec<String> {
     return options;
 }
 
+fn generate_pdf(spinner_style: &ProgressStyle, files: &Vec<ReadFile>) {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(spinner_style.clone());
+    pb.enable_steady_tick(Duration::from_millis(100));
+    pb.set_prefix("[3/4]");
+    pb.set_message("Generating Report...");
+    let start = Instant::now();
+    let font_family = genpdf::fonts::from_files(&"fonts", "Roboto", None).unwrap();
+    let mut doc = genpdf::Document::new(font_family);
+    doc.set_title("Duplicate File Finder Report");
+    doc.set_font_size(13);
+    let mut decorator = genpdf::SimplePageDecorator::new();
+    decorator.set_margins(10);
+    doc.set_page_decorator(decorator);
+    let title = genpdf::elements::Paragraph::new("Duplicate File Finder Report");
+    doc.push(title);
+    let mut table = genpdf::elements::TableLayout::new(vec![1, 1, 1]);
+    table.set_cell_decorator(genpdf::elements::FrameCellDecorator::new(true, true, false));
+    for file in files.iter() {
+        let mut row = table.row();
+        let path = genpdf::elements::Paragraph::new(file.first_path.file_name().unwrap().to_str().unwrap().to_string());
+        let count = genpdf::elements::Paragraph::new(format!("{} weitere", file.paths.len().to_string()));
+        let size = genpdf::elements::Paragraph::new(humansize::format_size(file.size, humansize::DECIMAL));
+        row.push_element(path);
+        row.push_element(count);
+        row.push_element(size);
+        row.push().unwrap();
+    }
+    doc.push(table);
+    let elapsed = start.elapsed();
+    pb.set_message(format!("Generated Report in {}", HumanDuration(elapsed)));
+    pb.finish();
+
+    let homedir = home::home_dir().unwrap();
+    let input: String = Input::new()
+        .with_prompt("Where do you want to save the report?")
+        .with_initial_text(homedir.display().to_string())
+        .default(homedir.display().to_string())
+        .interact_text()
+        .unwrap();
+
+    let path = Path::new(&input);
+
+    if !path.exists() {
+        println!("Path does not exist");
+        abort();
+    }
+
+    if !path.is_dir() {
+        println!("Path is not a directory");
+        abort();
+    }
+    
+    let filename = format!("file_copy_checker_report_{}.pdf", chrono::Local::now().format("%Y-%m-%d_%H-%M-%S"));
+    doc.render_to_file(path.join(filename)).unwrap();
+}
+
 fn main() {
     // get current working directory
     let cwd = std::env::current_dir().unwrap();
@@ -267,7 +325,7 @@ fn main() {
     let pb = ProgressBar::new_spinner();
     pb.set_style(spinner_style.clone());
     pb.enable_steady_tick(Duration::from_millis(100));
-    pb.set_prefix("[1/5]");
+    pb.set_prefix("[1/4]");
     pb.set_message(format!("Looking for files..."));
     let start = Instant::now();
     let result = calculate_file_count(&base_path, &pb);    
@@ -280,27 +338,26 @@ fn main() {
     let pb: ProgressBar = ProgressBar::new_spinner();
     pb.set_style(spinner_style.clone());
     pb.enable_steady_tick(Duration::from_millis(100));
-    pb.set_prefix("[2/5]");
+    pb.set_prefix("[2/4]");
     let start: Instant = Instant::now();
     collect_files(&base_path, &mut files,  &pb);
     files.retain(|f| f.paths.len() > 0);
-    for file in files.iter_mut() {
-        file.size = filesize::file_real_size(file.first_path.as_path()).unwrap();
-    };
     files.sort_by(|a, b| b.size.cmp(&a.size));
     let mut duplicate_count = 0;
+    let mut full_size = 0;
     for file in files.iter() {
         duplicate_count += file.paths.len();
+        full_size += file.size * (file.paths.len() + 1) as u64;
     }
     let elapsed: Duration = start.elapsed();
-    let mut message = format!("Collected {} files ({} duplicates) in {}", files.len(), duplicate_count, HumanDuration(elapsed));
+    let mut message = format!("Collected {} files ({} duplicates) ({}) in {}", files.len(), duplicate_count, humansize::format_size(full_size, humansize::DECIMAL), HumanDuration(elapsed));
     if files.len() == 0 {
         pb.set_message(format!("No duplicates found"));
         pb.finish();
         abort();
     }
     if files.len() == 1 {
-        message = format!("Collected {} file ({} duplicates) in {}", files.len(), duplicate_count, HumanDuration(elapsed));
+        message = format!("Collected {} file ({} duplicates) ({}) in {}", files.len(), duplicate_count, humansize::format_size(full_size, humansize::DECIMAL), HumanDuration(elapsed));
     }
     pb.set_message(message);
     pb.finish();
@@ -329,49 +386,7 @@ fn main() {
 
     // generate report
     if selection == 4 {
-        let font_family = genpdf::fonts::from_files(&"fonts", "Roboto", None).unwrap();
-        let mut doc = genpdf::Document::new(font_family);
-        doc.set_title("Duplicate File Finder Report");
-        doc.set_font_size(13);
-        let mut decorator = genpdf::SimplePageDecorator::new();
-        decorator.set_margins(10);
-        doc.set_page_decorator(decorator);
-        let title = genpdf::elements::Paragraph::new("Duplicate File Finder Report");
-        doc.push(title);
-        let mut table = genpdf::elements::TableLayout::new(vec![1, 1]);
-        table.set_cell_decorator(genpdf::elements::FrameCellDecorator::new(true, true, false));
-        for file in files.iter() {
-            let size = humansize::format_size(file.size, humansize::DECIMAL);
-            let mut row = table.row();
-            let filename: String = file.first_path.file_name().unwrap().to_str().unwrap().to_string();
-            row.push_element(genpdf::elements::Paragraph::new(filename));
-            row.push_element(genpdf::elements::Paragraph::new(size));
-            row.push().unwrap();
-        }
-        doc.push(table);
-
-        let homedir = home::home_dir().unwrap();
-        let input: String = Input::new()
-            .with_prompt("Where do you want to save the report?")
-            .with_initial_text(homedir.display().to_string())
-            .default(homedir.display().to_string())
-            .interact_text()
-            .unwrap();
-
-        let path = Path::new(&input);
-
-        if !path.exists() {
-            println!("Path does not exist");
-            abort();
-        }
-
-        if !path.is_dir() {
-            println!("Path is not a directory");
-            abort();
-        }
-        
-        let filename = format!("file_copy_checker_report_{}.pdf", chrono::Local::now().format("%Y-%m-%d_%H-%M-%S"));
-        doc.render_to_file(path.join(filename)).unwrap();
+        generate_pdf(&spinner_style, &files);
         done(&spinner_style);
     }
 
@@ -391,7 +406,7 @@ fn main() {
         let pb = ProgressBar::new_spinner();
         pb.set_style(spinner_style.clone());
         pb.enable_steady_tick(Duration::from_millis(100));
-        pb.set_prefix("[4/5]");
+        pb.set_prefix("[3/4]");
         pb.set_message(format!("Deleting {} files", chosen.len()));
         for i in chosen {
             let items: Vec<&str> = options[i].split("HASH: [").collect();
@@ -437,7 +452,7 @@ fn main() {
         let pb = ProgressBar::new_spinner();
         pb.set_style(spinner_style.clone());
         pb.enable_steady_tick(Duration::from_millis(100));
-        pb.set_prefix("[4/5]");
+        pb.set_prefix("[3/4]");
         pb.set_message(format!("Deleting {} files", chosen.len()));
         for i in chosen {
             let items: Vec<&str> = options[i].split("[").collect();
