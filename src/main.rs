@@ -1,6 +1,5 @@
 use std::path::Path;
-use std::fs::read_dir;
-use std::fs::remove_file;
+use std::fs;
 use std::os::unix::fs::symlink;
 use std::fs::File;
 use std::io::BufReader;
@@ -8,26 +7,17 @@ use std::io::Read;
 use std::path::PathBuf;
 use md5hash::MD5Hasher;
 use std::time::{Duration, Instant};
+use csv::Writer;
 use indicatif::{HumanDuration, ProgressBar, ProgressStyle};
-use dialoguer::{FuzzySelect, Input, theme::ColorfulTheme, MultiSelect};
+use dialoguer::{FuzzySelect, Input, theme::ColorfulTheme, MultiSelect, Select};
 
 #[derive(Debug)]
 struct ReadFile {
   hash: String,
   first_path: PathBuf,
   paths: Vec<PathBuf>,
-  size: u64,
 }
 
-#[derive(Debug)]
-struct FileCountResult {
-  folders: u64,
-  files: u64,
-}
-
-/**
- * check if the current file should be ignored
- */
 fn should_ignore_file(path: &Path) -> bool {
     if !path.exists() {
         return true;
@@ -71,105 +61,73 @@ fn should_ignore_file(path: &Path) -> bool {
     return false;
 }
 
-/**
- * Collects all files in the given path and returns them as a vector of ReadFile structs.
- */
-fn collect_files(base_path: &Path, files: &mut Vec<ReadFile>, pb: &ProgressBar) {
+fn hash_file(path: &Path) -> String {
+    let file: File = File::open(&path).unwrap();
+    let mut reader = BufReader::new(file);
+    let mut buffer = Vec::new();
+    reader.read_to_end(&mut buffer).unwrap();
+
+    let mut hasher = MD5Hasher::new();
+    hasher.digest(&buffer);
+    let digest = hasher.finish();
+    let hash: String = format!("{:x}", digest).to_string();
+    return hash;
+}
+
+fn process_file(path: &Path, files: &mut Vec<ReadFile>, duplicated_count: &mut u64) {
+    if should_ignore_file(&path) {
+        return;
+    }
+
+    let hash = hash_file(&path);
+
+    let mut found = false;
+    for (i, f) in files.iter().enumerate() {
+        if f.hash == hash {
+            files[i].paths.push(path.to_path_buf());
+            *duplicated_count += 1;
+            found = true;
+            break;
+        }
+    }
+
+    if found {
+        return;
+    }
+
+    // let size = filesize::file_real_size(path.clone()).unwrap();
+    files.push(ReadFile { 
+        hash,
+        first_path: path.to_path_buf(),
+        paths: vec![],
+    });
+}
+
+fn process_directory(base_path: &Path, files: &mut Vec<ReadFile>, duplicated_count: &mut u64, pb: &ProgressBar) {
     pb.set_message(format!("Collecting files in {}", base_path.display()));
 
-    let dir = read_dir(base_path).unwrap();
+    let dir = fs::read_dir(base_path).unwrap();
 
     for entry in dir {
         let entry = entry.unwrap();
         let path = entry.path();
 
         if path.is_dir() {
-            collect_files(&path, files, pb);
-            continue;
-        }
-
-        if should_ignore_file(&path) {
+            process_directory(&path, files, duplicated_count, pb);
             continue;
         }
         
-        let file: File = File::open(&path).unwrap();
-        let mut reader = BufReader::new(file);
-        let mut buffer = Vec::new();
-        reader.read_to_end(&mut buffer).unwrap();
-
-        let mut hasher = MD5Hasher::new();
-        hasher.digest(&buffer);
-        let digest = hasher.finish();
-        let hash: String = format!("{:x}", digest).to_string();
-
-        let mut found = false;
-        for (i, f) in files.iter().enumerate() {
-            if f.hash == hash {
-                files[i].paths.push(path.to_path_buf());
-                pb.set_message(format!("Found duplicate {}", path.display()));
-                found = true;
-                break;
-            }
-        }
-
-        if found {
-            continue;
-        }
-
-        let size = filesize::file_real_size(path.clone()).unwrap();
-        files.push(ReadFile { 
-            hash,
-            first_path: path.to_path_buf(),
-            paths: vec![],
-            size
-        });
-        pb.set_message(format!("Found new file {}", path.display()));
+        process_file(&path, files, duplicated_count);
     }
+
+    files.retain(|f| f.paths.len() > 0);
 }
 
-/**
- * Calculates the number of files that are beeing checked
- */
-fn calculate_file_count(path: &Path, pb: &ProgressBar) -> FileCountResult {
-    if path.is_file() {
-        return FileCountResult { files: 1, folders: 0 };
-    }
-
-    pb.set_message(format!("Calculating file count in {}", path.display()));
-
-    let dir = read_dir(path).unwrap();
-    let mut file_count: u64 = 0;
-    let mut folder_count: u64 = 0;
-
-    for entry in dir {
-        let entry = entry.unwrap();
-        let path = entry.path();
-
-        if path.is_dir() {
-            folder_count += 1;
-            let new_counts =  calculate_file_count(&path, pb);
-            file_count += new_counts.files;
-            folder_count += new_counts.folders;
-            continue;
-        } 
-        
-        if should_ignore_file(&path) {
-            continue;
-        }
-        file_count += 1;
-    }
-
-    return FileCountResult { files: file_count, folders: folder_count };
-}
-
-/**
- * Delete all files from the duplicates array
- */
 fn remove_files(files: &Vec<ReadFile>, spinner_style: &ProgressStyle) {
     let pb = ProgressBar::new_spinner();
     pb.set_style(spinner_style.clone());
     pb.enable_steady_tick(Duration::from_millis(100));
-    pb.set_prefix("[3/4]");
+    pb.set_prefix("[2/2]");
     pb.set_message(format!("Removing duplicates"));
 
     for file in files {
@@ -178,7 +136,7 @@ fn remove_files(files: &Vec<ReadFile>, spinner_style: &ProgressStyle) {
             if should_ignore_file(&path) {
                 continue;
             }
-            remove_file(&path).unwrap();
+            fs::remove_file(&path).unwrap();
             pb.set_message(format!("Removed {}", p.display()));
         }
     }
@@ -186,14 +144,11 @@ fn remove_files(files: &Vec<ReadFile>, spinner_style: &ProgressStyle) {
     pb.finish();
 }
 
-/**
- * Delete all files from the duplicates array and create symbolic links to the original files
- */
 fn remove_files_and_create_symbolic_links(files: &Vec<ReadFile>, spinner_style: &ProgressStyle) {
     let pb = ProgressBar::new_spinner();
     pb.set_style(spinner_style.clone());
     pb.enable_steady_tick(Duration::from_millis(100));
-    pb.set_prefix("[3/4]");
+    pb.set_prefix("[2/2]");
     pb.set_message(format!("Removing duplicates and creating symbolic links"));
 
     for file in files {
@@ -202,7 +157,7 @@ fn remove_files_and_create_symbolic_links(files: &Vec<ReadFile>, spinner_style: 
             if should_ignore_file(&path) {
                 continue;
             }
-            remove_file(&path).unwrap();
+            fs::remove_file(&path).unwrap();
             symlink(file.first_path.as_path(), &path).unwrap();
             pb.set_message(format!("Removed {} and created symbolic link to {}", file.first_path.display(), path.display()));
         }      
@@ -212,39 +167,27 @@ fn remove_files_and_create_symbolic_links(files: &Vec<ReadFile>, spinner_style: 
     pb.finish();
 }
 
-/**
- * Removes the file and creates a symbolic link to the original file
- */
 fn remove_file_and_symlink(original_file: &Path, file: &Path, pb: &ProgressBar) {
     pb.set_message(format!("Removing {} and creating symbolic link to {}", file.display(), original_file.display()));
-    remove_file(&file).unwrap();
+    fs::remove_file(&file).unwrap();
     symlink(&original_file, &file).unwrap();
 }
 
-/**
- * Aborts the Program
- */
 fn abort() {
     println!("Aborted");
     std::process::exit(0);
 }
 
-/**
- * Finishes the Program
- */
 fn done(spinner_style: &ProgressStyle) {
     let pb = ProgressBar::new_spinner();
     pb.set_style(spinner_style.clone());
     pb.enable_steady_tick(Duration::from_millis(100));
-    pb.set_prefix("[4/4]");
+    pb.set_prefix("[2/2]");
     pb.set_message("Done!");
     pb.finish();
     std::process::exit(0);
 }
 
-/**
- * Generates the options for the user to select from
- */
 fn generate_options(files: &Vec<ReadFile>) -> Vec<String> {
     let mut options: Vec<String> = Vec::new();
     for (i, file) in files.iter().enumerate() {
@@ -257,44 +200,60 @@ fn generate_options(files: &Vec<ReadFile>) -> Vec<String> {
     return options;
 }
 
-fn generate_pdf(spinner_style: &ProgressStyle, files: &Vec<ReadFile>) {
+fn generate_pdf(spinner_style: &ProgressStyle, files: &Vec<ReadFile>, show_file_sizes: bool) {
     let pb = ProgressBar::new_spinner();
     pb.set_style(spinner_style.clone());
     pb.enable_steady_tick(Duration::from_millis(100));
-    pb.set_prefix("[3/4]");
+    pb.set_prefix("[2/2]");
     pb.set_message("Generating Report...");
+    
     let start = Instant::now();
     let font_family = genpdf::fonts::from_files(&"fonts", "Roboto", None).unwrap();
     let mut doc = genpdf::Document::new(font_family);
+    let mut decorator = genpdf::SimplePageDecorator::new();
+    let title = genpdf::elements::Paragraph::new("Duplicate File Finder Report");
+    let mut column_vec = vec![1, 1, 1];
+    if show_file_sizes {
+        column_vec.push(1);
+    }
+    let mut table = genpdf::elements::TableLayout::new(column_vec);
+    
     doc.set_title("Duplicate File Finder Report");
     doc.set_font_size(13);
-    let mut decorator = genpdf::SimplePageDecorator::new();
     decorator.set_margins(10);
     doc.set_page_decorator(decorator);
-    let title = genpdf::elements::Paragraph::new("Duplicate File Finder Report");
     doc.push(title);
-    let mut table = genpdf::elements::TableLayout::new(vec![1, 1, 1]);
     table.set_cell_decorator(genpdf::elements::FrameCellDecorator::new(true, true, false));
+
     for file in files.iter() {
         let mut row = table.row();
         let path = genpdf::elements::Paragraph::new(file.first_path.file_name().unwrap().to_str().unwrap().to_string());
         let count = genpdf::elements::Paragraph::new(format!("{} weitere", file.paths.len().to_string()));
-        let size = genpdf::elements::Paragraph::new(humansize::format_size(file.size, humansize::DECIMAL));
+        let hash = genpdf::elements::Paragraph::new(file.hash.clone());
         row.push_element(path);
         row.push_element(count);
-        row.push_element(size);
+        row.push_element(hash);
+        
+        if show_file_sizes {
+            let file_size = filesize::file_real_size(file.first_path.clone()).unwrap();
+            let file_size = humansize::format_size(file_size, humansize::DECIMAL);
+            let file_size = genpdf::elements::Paragraph::new(file_size);
+            row.push_element(file_size);
+        }
+        
         row.push().unwrap();
     }
+
     doc.push(table);
     let elapsed = start.elapsed();
     pb.set_message(format!("Generated Report in {}", HumanDuration(elapsed)));
-    pb.finish();
+    
 
-    let homedir = home::home_dir().unwrap();
+    let homedir = home::home_dir().unwrap().display().to_string();
     let input: String = Input::new()
         .with_prompt("Where do you want to save the report?")
-        .with_initial_text(homedir.display().to_string())
-        .default(homedir.display().to_string())
+        .with_initial_text(&homedir)
+        .default(homedir)
         .interact_text()
         .unwrap();
 
@@ -310,8 +269,63 @@ fn generate_pdf(spinner_style: &ProgressStyle, files: &Vec<ReadFile>) {
         abort();
     }
     
+    pb.set_message(format!("Saving report to {}", path.display()));
     let filename = format!("file_copy_checker_report_{}.pdf", chrono::Local::now().format("%Y-%m-%d_%H-%M-%S"));
     doc.render_to_file(path.join(filename)).unwrap();
+    pb.set_message(format!("Saved report to {}", path.display()));
+    pb.finish();
+}
+
+fn generate_csv(spinner_style: &ProgressStyle, files: &Vec<ReadFile>, show_file_sizes: bool) {
+    let homedir = home::home_dir().unwrap().display().to_string();
+    let input: String = Input::new()
+        .with_prompt("Where do you want to save the report?")
+        .with_initial_text(&homedir)
+        .default(homedir)
+        .interact_text()
+        .unwrap();
+
+    let path = Path::new(&input);
+
+    if !path.exists() {
+        println!("Path does not exist");
+        abort();
+    }
+
+    if !path.is_dir() {
+        println!("Path is not a directory");
+        abort();
+    }
+
+    let filename = format!("file_copy_checker_report_{}.csv", chrono::Local::now().format("%Y-%m-%d_%H-%M-%S"));
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(spinner_style.clone());
+    pb.enable_steady_tick(Duration::from_millis(100));
+    pb.set_prefix("[2/2]");
+    pb.set_message("Generating Report...");
+    let start = Instant::now();
+    let mut wrt = Writer::from_path(path.join(filename)).unwrap();
+    let mut headers = vec!["Filename", "Duplicates", "Hash"];
+    if show_file_sizes {
+        headers.push("Size");
+    }
+    wrt.write_record(&headers).unwrap();
+    for file in files {
+        let mut row = Vec::new();
+        row.push(file.first_path.display().to_string());
+        row.push(file.paths.len().to_string());
+        row.push(file.hash.to_string());
+        if show_file_sizes {
+            println!("Getting file size for {}", file.first_path.display().to_string());
+            let file_size = filesize::file_real_size(file.first_path.clone()).unwrap();
+            let file_size = humansize::format_size(file_size, humansize::DECIMAL);
+            row.push(file_size);
+        }
+        wrt.write_record(&row).unwrap();
+    }
+    let elapsed = start.elapsed();
+    pb.set_message(format!("Saved report to {} in {}", path.display().to_string(), HumanDuration(elapsed)));
+    pb.finish();
 }
 
 fn main() {
@@ -319,47 +333,25 @@ fn main() {
     let cwd = std::env::current_dir().unwrap();
     let base_path: &Path = cwd.as_path();
 
-    let spinner_style: ProgressStyle = ProgressStyle::with_template("{prefix:.bold.dim} {spinner} {wide_msg}").unwrap().tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈");
+    let spinner_style: ProgressStyle = ProgressStyle::with_template("{prefix:.bold.dim} {spinner} {wide_msg}").unwrap().tick_chars("⠁⠂⠄⠠⠐⠈");
 
-    // calculate file count
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(spinner_style.clone());
-    pb.enable_steady_tick(Duration::from_millis(100));
-    pb.set_prefix("[1/4]");
-    pb.set_message(format!("Looking for files..."));
-    let start = Instant::now();
-    let result = calculate_file_count(&base_path, &pb);    
-    let elapsed = start.elapsed();
-    pb.set_message(format!("Found {} files and {} folders in {}", result.files, result.folders, HumanDuration(elapsed)));
-    pb.finish();
-
-    // collect files
     let mut files: Vec<ReadFile> = Vec::new();
+    let mut duplicate_count: u64 = 0;
     let pb: ProgressBar = ProgressBar::new_spinner();
     pb.set_style(spinner_style.clone());
     pb.enable_steady_tick(Duration::from_millis(100));
-    pb.set_prefix("[2/4]");
+    pb.set_prefix("[1/2]");
     let start: Instant = Instant::now();
-    collect_files(&base_path, &mut files,  &pb);
-    files.retain(|f| f.paths.len() > 0);
-    files.sort_by(|a, b| b.size.cmp(&a.size));
-    let mut duplicate_count = 0;
-    let mut full_size = 0;
-    for file in files.iter() {
-        duplicate_count += file.paths.len();
-        full_size += file.size * (file.paths.len() + 1) as u64;
-    }
+    process_directory(&base_path, &mut files, &mut duplicate_count, &pb);
     let elapsed: Duration = start.elapsed();
-    let mut message = format!("Collected {} files ({} duplicates) ({}) in {}", files.len(), duplicate_count, humansize::format_size(full_size, humansize::DECIMAL), HumanDuration(elapsed));
+    
     if files.len() == 0 {
         pb.set_message(format!("No duplicates found"));
         pb.finish();
         abort();
     }
-    if files.len() == 1 {
-        message = format!("Collected {} file ({} duplicates) ({}) in {}", files.len(), duplicate_count, humansize::format_size(full_size, humansize::DECIMAL), HumanDuration(elapsed));
-    }
-    pb.set_message(message);
+
+    pb.set_message(format!("Found {} duplicates ({})", duplicate_count, HumanDuration(elapsed)));
     pb.finish();
 
 
@@ -368,7 +360,12 @@ fn main() {
         "Remove duplicates and create symbolic links",
         "Select duplicates to remove",
         "Select duplicates to remove and create symbolic links",
-        "Generate Report and exit",
+        "Generate PDF Report and exit",
+        "Generate PDF Report with file sizes and exit",
+        "Generate CSV Report and exit",
+        "Generate CSV Report with file sizes and exit",
+        "Show Duplicates of a specific file",
+        "Show Duplicates of a specific file with file size",
         "Abort"
     ];
 
@@ -380,13 +377,79 @@ fn main() {
         .unwrap();
 
     // abort
-    if selection == 5 {
+    if selection == 10 {
         abort();
+    }
+
+    // show duplicates of a specific file with file size
+    if selection == 9 {
+        let options = generate_options(&files);
+        
+        let index = Select::with_theme(&ColorfulTheme::default())
+            .items(&options)
+            .interact()
+            .unwrap();
+
+        let option = &options[index];
+        let items: Vec<&str> = option.split("HASH: [").collect();
+        let hash = items[1].replace("]", "");
+
+        let file = files.iter().find(|&f| f.hash == hash).unwrap();
+        let size = filesize::file_real_size(file.first_path.clone()).unwrap();
+        let size = humansize::format_size(size, humansize::DECIMAL);
+        println!("Listing files...");
+        println!("{} {}", file.first_path.display().to_string(), size);
+        for path in file.paths.iter() {
+            let size = filesize::file_real_size(path.clone()).unwrap();
+            let size = humansize::format_size(size, humansize::DECIMAL);
+            println!("{} {}", path.display().to_string(), size);
+        }
+        done(&spinner_style);
+    }
+
+    // show duplicates of a specific file
+    if selection == 8 {
+        let options = generate_options(&files);
+        
+        let index = Select::with_theme(&ColorfulTheme::default())
+            .items(&options)
+            .interact()
+            .unwrap();
+
+        let option = &options[index];
+        let items: Vec<&str> = option.split("HASH: [").collect();
+        let hash = items[1].replace("]", "");
+
+        let file = files.iter().find(|&f| f.hash == hash).unwrap();
+        println!("Listing files...");
+        println!("{}", file.first_path.display().to_string());
+        for path in file.paths.iter() {
+            println!("{}", path.display().to_string());
+        }
+        done(&spinner_style);
+    }
+
+    // generate csv report with file sizes
+    if selection == 7 {
+        generate_csv(&spinner_style, &files, true);
+        done(&spinner_style);
+    }
+
+    // generate csv report
+    if selection == 6 {
+        generate_csv(&spinner_style, &files, false);
+        done(&spinner_style);
+    }
+
+    // generate report with file sizes
+    if selection == 5 {
+        generate_pdf(&spinner_style, &files, true);
+        done(&spinner_style);
     }
 
     // generate report
     if selection == 4 {
-        generate_pdf(&spinner_style, &files);
+        generate_pdf(&spinner_style, &files, false);
         done(&spinner_style);
     }
 
@@ -406,7 +469,7 @@ fn main() {
         let pb = ProgressBar::new_spinner();
         pb.set_style(spinner_style.clone());
         pb.enable_steady_tick(Duration::from_millis(100));
-        pb.set_prefix("[3/4]");
+        pb.set_prefix("[2/3]");
         pb.set_message(format!("Deleting {} files", chosen.len()));
         for i in chosen {
             let items: Vec<&str> = options[i].split("HASH: [").collect();
@@ -452,7 +515,7 @@ fn main() {
         let pb = ProgressBar::new_spinner();
         pb.set_style(spinner_style.clone());
         pb.enable_steady_tick(Duration::from_millis(100));
-        pb.set_prefix("[3/4]");
+        pb.set_prefix("[2/3]");
         pb.set_message(format!("Deleting {} files", chosen.len()));
         for i in chosen {
             let items: Vec<&str> = options[i].split("[").collect();
@@ -470,10 +533,10 @@ fn main() {
 
             for path in paths {
                 pb.set_message(format!("Deleting {}", path.display()));
-                remove_file(path).unwrap();
+                fs::remove_file(path).unwrap();
             }
             pb.set_message(format!("Deleting {}", original_file.display()));
-            remove_file(original_file).unwrap();
+            fs::remove_file(original_file).unwrap();
         }
         pb.finish();
         done(&spinner_style);
